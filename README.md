@@ -86,6 +86,4 @@ sollumz_dds_prep/
 
 The compression backend (`csdevcompress.exe`) is built upon the open-source [nvidia-texture-tools](https://github.com/castano/nvidia-texture-tools) by **Ignacio Castaño** (MIT License).
 
-## License
 
-MIT License. Developed for the GTA V modding and 3D artist community by **CSDEV**.
