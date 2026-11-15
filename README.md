@@ -23,11 +23,11 @@ Your source images are never overwritten.
 
 | Setting | Default | Notes |
 |:---|:---|:---|
-| Compression | Auto (By Role) | Diffuse and Normal maps default to BC1; transparent images keep their alpha (BC3). |
-| Mipmaps | On | Full chain, Mitchell-Netravali filter. |
+| Compression | Auto (By Role) | Diffuse and Normal maps default to BC1; transparent textures use BC3; Tint Palettes (`TintPaletteSampler`) automatically use uncompressed 32-bit RGBA8 (`A8R8G8B8`). |
+| Mipmaps | On (Auto-Off for Palettes) | Full chain with Mitchell-Netravali downsampling filter down to 4x4. Automatically disabled for Tint Palettes to prevent neighbor color bleeding. |
 | Minimum mip size | 4x4 | 1x1 and 2x2 mips can show up as black pixels in game, so it stops at 4x4. |
 | Mip gamma correction | Automatic | On for diffuse. Off for normal and specular, so normals and roughness don't get warped. |
-| Power of two | On | Something like 1023x511 gets rounded to the nearest valid size. Range is 4x4 up to 8192x8192, aspect ratio kept. |
+| Power of two | On (Ignored for Palettes) | Standard textures get rounded to power of two. Tint Palettes strictly preserve their exact original resolution (e.g. 256x1, 256x16) and ignore Power-of-Two/block rules. |
 | Relink materials | On | Updates the image datablocks to the new .dds files while preserving all node settings (Embedded toggle, HD flag, colorspace). |
 | Output location | Next to the source files | Or pick a custom folder. |
 | Worker threads | 8 | Change it in the add-on preferences, anywhere from 1 to 32. |
@@ -59,7 +59,18 @@ Open Properties > Material > Texture Parameters. Each texture slot (`DiffuseSamp
 - Green: already a `.dds`.
 - Red: not a `.dds` yet.
 
-Click the badge, choose a format (BC1, BC3, BC5 or BC7) and a resolution, then hit OK.
+Click the badge, choose a format (BC1, BC3, BC5, BC7, or RGBA8 8.8.8.8), toggle mipmaps if needed, pick a resolution, and hit OK.
+
+### Tint Palettes & Uncompressed RGBA8 (8.8.8.8)
+
+GTA V tint palettes (`TintPaletteSampler`) are color lookup palettes used for clothing, vehicle trims, and hair colors. Standard block compression (BC1/BC3/BC7) introduces block quantization shifts that ruin palette colors, and mipmaps blend neighboring color indices.
+
+DDS Prep handles this automatically:
+- Formats tint palettes to uncompressed **RGBA8 (8.8.8.8)** (`A8R8G8B8` DirectDraw Surface).
+- **Preserves exact original resolution:** Power-of-Two rounding and block-multiple constraints are completely ignored for tint palettes, preserving exact dimensions like `256x1`, `256x2`, `256x16`, etc.
+- **Mipmap generation is automatically disabled** (`dwMipMapCount = 1`) to prevent neighboring color bleeding.
+- Color values remain 100% bit-exact and lossless.
+- A **Generate Mipmaps** toggle is available in both the global settings and single conversion dialog if you need manual control.
 
 ## Repository layout
 
@@ -86,4 +97,6 @@ sollumz_dds_prep/
 
 The compression backend (`csdevcompress.exe`) is built upon the open-source [nvidia-texture-tools](https://github.com/castano/nvidia-texture-tools) by **Ignacio Castaño** (MIT License).
 
+## License
 
+MIT License. Developed for the GTA V modding and 3D artist community by **CSDEV**.

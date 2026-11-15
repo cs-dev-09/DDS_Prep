@@ -262,12 +262,15 @@ def _short_format_label(fmt_name: str) -> str:
         return "BC5"
     if "BC7" in fmt_name:
         return "BC7"
+    if "RGBA8" in fmt_name or "8.8.8.8" in fmt_name:
+        return "RGBA8"
     return fmt_name
 
 
 def _preview_item_target(settings, item) -> tuple:
     """Return (target_w, target_h, short_fmt) for live preview in the UIList."""
-    if settings.use_quality_preset:
+    is_tint = any(x in item.role.lower() for x in ("tint", "palette", "pal"))
+    if settings.use_quality_preset and not is_tint:
         qp = settings.quality_preset
         global_res = qp if qp.endswith('%') else int(qp)
     else:
@@ -280,8 +283,9 @@ def _preview_item_target(settings, item) -> tuple:
         has_alpha=item.has_alpha,
         override=item if item.use_override else None,
     )
+    enforce_pot = False if is_tint else settings.enforce_power_of_two
     tw, th = core.resolve_target_dimensions(
-        item.width, item.height, resolved["res"], settings.enforce_power_of_two
+        item.width, item.height, resolved["res"], enforce_pot, is_tint=is_tint
     )
     return tw, th, _short_format_label(resolved["format"])
 
@@ -350,9 +354,14 @@ def _tag_redraw_all(context):
             area.tag_redraw()
 
 
-def _prepare_input_file(image, target_w, target_h, temp_dir, output_file):
+def _prepare_input_file(image, target_w, target_h, temp_dir, output_file, is_rgba8=False, mip_options=None):
     if core.is_unsupported_format(image):
         raise RuntimeError(f"EXR/HDR floating-point files are not supported: {image.name}")
+
+    if is_rgba8:
+        gen_mips = bool(mip_options and mip_options.get("generate", False))
+        core.write_rgba8_dds(image, output_file, target_w, target_h, generate_mipmaps=gen_mips)
+        return output_file
 
     try:
         src_path = os.path.abspath(bpy.path.abspath(image.filepath)) if image.filepath else ""
@@ -602,8 +611,15 @@ class SOLLUMZDDS_OT_convert_single(bpy.types.Operator):
             ("BC3", "DXT5 (BC3)", "Interpolated alpha - for diffuse textures with transparency"),
             ("BC5", "BC5", "Two channel - optional high-quality normal/bump maps (BumpSampler)"),
             ("BC7", "BC7", "High quality, full alpha - best for high-detail specular/normal/diffuse maps"),
+            ("RGBA8", "RGBA8 (8.8.8.8)", "Uncompressed 32-bit RGBA - lossless quality, required for tint palettes"),
         ],
         default="BC3",
+    )
+
+    generate_mipmaps: bpy.props.BoolProperty(
+        name="Generate Mipmaps",
+        description="Generate Mitchell-Netravali mipmaps down to 4x4px (disable for tint palettes or UI icons)",
+        default=True,
     )
 
     resolution: bpy.props.EnumProperty(
@@ -630,17 +646,23 @@ class SOLLUMZDDS_OT_convert_single(bpy.types.Operator):
         node = mat.node_tree.nodes.get(self.node_name) if mat and mat.node_tree else None
         node_str = (self.node_name or "").lower()
 
-        # Smart format default based on sampler type & image properties
-        if any(x in node_str for x in ("bump", "norm")):
+        # Smart format & mipmap defaults based on sampler type & image properties
+        if any(x in node_str for x in ("tint", "palette", "pal")):
+            self.format = "RGBA8"
+            self.generate_mipmaps = False
+        elif any(x in node_str for x in ("bump", "norm")):
             self.format = "BC1"
+            self.generate_mipmaps = context.scene.sollumz_dds_settings.mip_generate
         elif any(x in node_str for x in ("spec", "gloss")):
             self.format = "BC3"
+            self.generate_mipmaps = context.scene.sollumz_dds_settings.mip_generate
         else:
             has_alpha = False
             if node and node.image:
                 core.ensure_image_loaded(node.image)
                 has_alpha = (node.image.depth in (32, 64))
             self.format = "BC3" if has_alpha else "BC1"
+            self.generate_mipmaps = context.scene.sollumz_dds_settings.mip_generate
 
         self.resolution = "ORIGINAL"
         return context.window_manager.invoke_props_dialog(self, width=320)
@@ -661,7 +683,7 @@ class SOLLUMZDDS_OT_convert_single(bpy.types.Operator):
             role = "Specular"
         elif any(x in node_lower for x in ("detail",)):
             role = "Detail"
-        elif any(x in node_lower for x in ("tint", "palette")):
+        elif any(x in node_lower for x in ("tint", "palette", "pal")):
             role = "Tint"
         else:
             role = "Color"
@@ -679,12 +701,24 @@ class SOLLUMZDDS_OT_convert_single(bpy.types.Operator):
         col = layout.column(align=True)
         col.prop(self, "format")
         col.prop(self, "resolution")
+        col.prop(self, "generate_mipmaps")
 
     def execute(self, context):
-        exe_path = get_compressor_path(context)
-        if not core.is_available(exe_path):
-            self.report({'ERROR'}, "Compression engine (csdevcompress.exe) not found. Check Add-on Preferences.")
-            return {'CANCELLED'}
+        comp_format = self.format
+        if comp_format == "BC3":
+            comp_format = "DXT5 (BC3)"
+        elif comp_format == "BC1":
+            comp_format = "DXT1 (BC1)"
+        elif comp_format == "RGBA8":
+            comp_format = "RGBA8 (8.8.8.8)"
+
+        is_rgba8 = core.is_rgba8_format(comp_format)
+        exe_path = ""
+        if not is_rgba8:
+            exe_path = get_compressor_path(context)
+            if not core.is_available(exe_path):
+                self.report({'ERROR'}, "Compression engine (csdevcompress.exe) not found. Check Add-on Preferences.")
+                return {'CANCELLED'}
 
         mat = bpy.data.materials.get(self.material_name)
         if not mat or not mat.node_tree:
@@ -713,8 +747,16 @@ class SOLLUMZDDS_OT_convert_single(bpy.types.Operator):
         orig_hd = getattr(image, "sz_is_hd", None)
         settings = context.scene.sollumz_dds_settings
 
-        # Resolve target dimensions
-        if self.resolution == "ORIGINAL":
+        node_lower = (self.node_name or "").lower()
+        is_tint = is_rgba8 or any(x in node_lower for x in ("tint", "palette", "pal"))
+
+        # Resolve target dimensions (tint palettes strictly preserve exact resolution & ignore PoT)
+        if is_tint:
+            if self.resolution == "ORIGINAL":
+                target_w, target_h = w, h
+            else:
+                target_w, target_h = core.resolve_target_dimensions(w, h, self.resolution, False, is_tint=True)
+        elif self.resolution == "ORIGINAL":
             target_w, target_h = (
                 core.nearest_power_of_two(w),
                 core.nearest_power_of_two(h)
@@ -736,16 +778,13 @@ class SOLLUMZDDS_OT_convert_single(bpy.types.Operator):
         temp_dir = tempfile.mkdtemp(prefix="sollumz_dds_single_")
 
         try:
-            input_file = _prepare_input_file(image, target_w, target_h, temp_dir, output_file)
-            mip_options = {"generate": settings.mip_generate}
+            mip_options = {"generate": self.generate_mipmaps}
+            input_file = _prepare_input_file(
+                image, target_w, target_h, temp_dir, output_file,
+                is_rgba8=is_rgba8, mip_options=mip_options
+            )
             node_lower = (self.node_name or "").lower()
             is_color = not any(x in node_lower for x in ("bump", "norm", "spec", "gloss", "orm", "rough"))
-
-            comp_format = self.format
-            if comp_format == "BC3":
-                comp_format = "DXT5 (BC3)"
-            elif comp_format == "BC1":
-                comp_format = "DXT1 (BC1)"
 
             core.run(
                 exe_path,
@@ -868,8 +907,13 @@ class SOLLUMZDDS_OT_convert(bpy.types.Operator):
                 override=item if item.use_override else None,
             )
 
+            is_tint = any(x in item.role.lower() for x in ("tint", "palette", "pal"))
+            # Tint palettes must NEVER have mipmaps
+            gen_mips = False if is_tint else settings.mip_generate
+
+            enforce_pot = False if is_tint else settings.enforce_power_of_two
             target_w, target_h = core.resolve_target_dimensions(
-                image.size[0], image.size[1], resolved["res"], settings.enforce_power_of_two,
+                image.size[0], image.size[1], resolved["res"], enforce_pot, is_tint=is_tint,
             )
 
             jobs.append({
@@ -882,6 +926,7 @@ class SOLLUMZDDS_OT_convert(bpy.types.Operator):
                 "target_w": target_w,
                 "target_h": target_h,
                 "format": resolved["format"],
+                "generate_mipmaps": gen_mips,
             })
         return jobs
 
@@ -891,7 +936,13 @@ class SOLLUMZDDS_OT_convert(bpy.types.Operator):
         prefs = get_prefs(context)
         exe_path = get_compressor_path(context)
 
-        if not core.is_available(exe_path):
+        jobs = self._build_jobs(context)
+        if not jobs:
+            self.report({'WARNING'}, "No valid textures to convert.")
+            return {'CANCELLED'}
+
+        needs_csdev = any(not core.is_rgba8_format(j["format"]) for j in jobs)
+        if needs_csdev and not core.is_available(exe_path):
             self.report({'ERROR'}, "csdevcompress.exe not found. Configure it in Addon Preferences.")
             return {'CANCELLED'}
 
@@ -904,13 +955,7 @@ class SOLLUMZDDS_OT_convert(bpy.types.Operator):
         else:
             out_dir = None
 
-        jobs = self._build_jobs(context)
-        if not jobs:
-            self.report({'WARNING'}, "No valid textures to convert.")
-            return {'CANCELLED'}
-
         self._temp_dir = tempfile.mkdtemp(prefix="sollumz_dds_prep_")
-        mip_options = {"generate": settings.mip_generate}
 
         prepared = []
         used_output_paths = set()
@@ -953,16 +998,20 @@ class SOLLUMZDDS_OT_convert(bpy.types.Operator):
             used_output_paths.add(os.path.normcase(candidate_path))
             output_file = candidate_path
 
+            job_mip_options = {"generate": job.get("generate_mipmaps", settings.mip_generate)}
+            is_rgba8 = core.is_rgba8_format(job["format"])
+
             item.status = "WAIT"
             try:
                 input_file = _prepare_input_file(
-                    image, job["target_w"], job["target_h"], self._temp_dir, output_file
+                    image, job["target_w"], job["target_h"], self._temp_dir, output_file,
+                    is_rgba8=is_rgba8, mip_options=job_mip_options
                 )
             except Exception as e:
                 item.status = f"FAILED: {e}"
                 continue
 
-            prepared.append((job, input_file, output_file))
+            prepared.append((job, input_file, output_file, job_mip_options))
 
         if not prepared:
             shutil.rmtree(self._temp_dir, ignore_errors=True)
@@ -975,14 +1024,14 @@ class SOLLUMZDDS_OT_convert(bpy.types.Operator):
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=prefs.max_workers)
         self._futures = {}
 
-        for job, input_file, output_file in prepared:
+        for job, input_file, output_file, job_mip_options in prepared:
             future = self._executor.submit(
                 core.run,
                 exe_path,
                 job["format"],
                 input_file,
                 output_file,
-                mip_options,
+                job_mip_options,
                 core.is_color_role(job["role"]),
                 self._active_procs,
                 self._proc_lock,

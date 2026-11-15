@@ -11,7 +11,7 @@ import subprocess
 import bpy
 
 # ==============================================================================
-# BACKEND (CSDEVCOMPRESS)
+# BACKEND (CSDEVCOMPRESS & UNCOMPRESSED DDS WRITER)
 # ==============================================================================
 
 FORMAT_MAP = {
@@ -19,14 +19,18 @@ FORMAT_MAP = {
     "DXT5 (BC3)": "-bc3",
     "BC5": "-bc5",
     "BC7": "-bc7",
+    "RGBA8 (8.8.8.8)": "-rgba8",
     "BC1": "-bc1",
     "BC3": "-bc3",
     "DXT1": "-bc1",
     "DXT5": "-bc3",
+    "RGBA8": "-rgba8",
+    "8.8.8.8": "-rgba8",
     "-bc1": "-bc1",
     "-bc3": "-bc3",
     "-bc5": "-bc5",
     "-bc7": "-bc7",
+    "-rgba8": "-rgba8",
 }
 
 DISPLAY_FORMATS = [
@@ -34,14 +38,16 @@ DISPLAY_FORMATS = [
     "DXT5 (BC3)",
     "BC5",
     "BC7",
+    "RGBA8 (8.8.8.8)",
 ]
 
 FORMAT_TOOLTIPS = {
-    "Auto (By Role)": "Automatically select BC3 for alpha, and BC1 otherwise (including normal maps)",
+    "Auto (By Role)": "Automatically select RGBA8 for tint palettes, BC1 for normal maps and opaque diffuse, BC3 for alpha",
     "DXT1 (BC1)": "No alpha - best for opaque diffuse/color maps, normal maps, and masks",
     "DXT5 (BC3)": "Interpolated alpha - for diffuse textures with transparency",
     "BC5": "Two channel - optional high-quality normal/bump maps (BumpSampler)",
     "BC7": "High quality, full alpha - best for high-detail specular/normal/diffuse maps",
+    "RGBA8 (8.8.8.8)": "Uncompressed 32-bit RGBA (A8R8G8B8) - lossless quality, required for tint palettes (TintPaletteSampler) to prevent color distortion",
 }
 
 CREATE_NO_WINDOW = 0x08000000 if platform.system() == "Windows" else 0
@@ -49,6 +55,129 @@ CREATE_NO_WINDOW = 0x08000000 if platform.system() == "Windows" else 0
 
 def is_available(exe_path: str) -> bool:
     return bool(exe_path) and os.path.isfile(exe_path)
+
+
+def is_rgba8_format(comp_format_display: str) -> bool:
+    fmt_u = str(comp_format_display).upper()
+    return "RGBA8" in fmt_u or "8.8.8.8" in fmt_u or "-RGBA8" in fmt_u.lower()
+
+
+def write_rgba8_dds(image, output_path: str, target_w: int = 0, target_h: int = 0, generate_mipmaps: bool = False):
+    """Write an uncompressed 32-bit RGBA (A8R8G8B8) DirectDraw Surface (DDS) file.
+
+    Standard uncompressed format for GTA V / Sollumz TintPaletteSampler (palettes),
+    ensuring zero block compression color shifts and pixel-exact lookup.
+    """
+    import struct
+    w, h = image.size[0], image.size[1]
+    if w == 0 or h == 0:
+        raise ValueError(f"Image '{image.name}' has 0 dimensions")
+
+    out_w = target_w if target_w > 0 else w
+    out_h = target_h if target_h > 0 else h
+
+    try:
+        import numpy as np
+        use_numpy = True
+    except ImportError:
+        use_numpy = False
+
+    if (w, h) != (out_w, out_h):
+        temp_img = bpy.data.images.new("__dds_tmp_scale", w, h, alpha=True)
+        try:
+            if use_numpy:
+                buf = np.empty(w * h * 4, dtype=np.float32)
+                image.pixels.foreach_get(buf)
+                temp_img.pixels.foreach_set(buf)
+                temp_img.scale(out_w, out_h)
+                arr = np.empty(out_w * out_h * 4, dtype=np.float32)
+                temp_img.pixels.foreach_get(arr)
+            else:
+                import array
+                buf = array.array('f', [0.0] * (w * h * 4))
+                image.pixels.foreach_get(buf)
+                temp_img.pixels.foreach_set(buf)
+                temp_img.scale(out_w, out_h)
+                arr = array.array('f', [0.0] * (out_w * out_h * 4))
+                temp_img.pixels.foreach_get(arr)
+        finally:
+            bpy.data.images.remove(temp_img)
+    else:
+        if use_numpy:
+            arr = np.empty(w * h * 4, dtype=np.float32)
+            image.pixels.foreach_get(arr)
+        else:
+            import array
+            arr = array.array('f', [0.0] * (w * h * 4))
+            image.pixels.foreach_get(arr)
+
+    if use_numpy:
+        # Convert float RGBA [0.0..1.0] to uint8 BGRA [0..255]
+        arr = (arr * 255.0 + 0.5).astype(np.uint8).reshape((out_h, out_w, 4))
+        bgra = np.empty_like(arr)
+        bgra[:, :, 0] = arr[:, :, 2]  # Blue
+        bgra[:, :, 1] = arr[:, :, 1]  # Green
+        bgra[:, :, 2] = arr[:, :, 0]  # Red
+        bgra[:, :, 3] = arr[:, :, 3]  # Alpha
+        # Flip vertically: Blender bottom-up -> DDS top-down
+        bgra = np.flipud(bgra)
+
+        levels = [bgra]
+        if generate_mipmaps:
+            curr = bgra
+            curr_w, curr_h = out_w, out_h
+            while curr_w > 1 or curr_h > 1:
+                next_w = max(1, curr_w // 2)
+                next_h = max(1, curr_h // 2)
+                if curr_h == 1:
+                    sub = curr[:, :next_w * 2]
+                    down = (sub.reshape(1, next_w, 2, 4).astype(np.uint32).sum(axis=2) // 2).astype(np.uint8)
+                elif curr_w == 1:
+                    sub = curr[:next_h * 2, :]
+                    down = (sub.reshape(next_h, 2, 1, 4).astype(np.uint32).sum(axis=1) // 2).astype(np.uint8)
+                else:
+                    sub = curr[:next_h * 2, :next_w * 2]
+                    down = (sub.reshape(next_h, 2, next_w, 2, 4).astype(np.uint32).sum(axis=(1, 3)) // 4).astype(np.uint8)
+                levels.append(down)
+                curr = down
+                curr_w, curr_h = next_w, next_h
+        payload = b''.join(lvl.tobytes() for lvl in levels)
+        mip_count = len(levels)
+    else:
+        # Pure Python fallback
+        raw = bytearray(out_w * out_h * 4)
+        for row in range(out_h):
+            src_row = (out_h - 1 - row) * out_w * 4
+            dst_row = row * out_w * 4
+            for col in range(out_w):
+                src_idx = src_row + col * 4
+                dst_idx = dst_row + col * 4
+                r = int(arr[src_idx] * 255.0 + 0.5)
+                g = int(arr[src_idx + 1] * 255.0 + 0.5)
+                b = int(arr[src_idx + 2] * 255.0 + 0.5)
+                a = int(arr[src_idx + 3] * 255.0 + 0.5)
+                raw[dst_idx] = max(0, min(255, b))
+                raw[dst_idx + 1] = max(0, min(255, g))
+                raw[dst_idx + 2] = max(0, min(255, r))
+                raw[dst_idx + 3] = max(0, min(255, a))
+        payload = bytes(raw)
+        mip_count = 1
+
+    magic = b'DDS '
+    has_mips = mip_count > 1
+    flags = 0x2100F if has_mips else 0x100F
+    pitch = out_w * 4
+    header_part1 = struct.pack('<IIIIIII11I', 124, flags, out_h, out_w, pitch, 0, mip_count, *([0]*11))
+    ddspf = struct.pack('<II4sIIIII', 32, 0x41, b'\x00\x00\x00\x00', 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000)
+    caps = 0x401008 if has_mips else 0x1000
+    header_part2 = struct.pack('<IIIII', caps, 0, 0, 0, 0)
+    header = magic + header_part1 + ddspf + header_part2
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(output_path, 'wb') as f:
+        f.write(header + payload)
 
 
 def build_command(exe_path, comp_format_display, input_file, output_file, mipmap_options, is_color_map):
@@ -84,6 +213,21 @@ def build_command(exe_path, comp_format_display, input_file, output_file, mipmap
 
 
 def run(exe_path, comp_format_display, input_file, output_file, mipmap_options, is_color_map, active_procs=None, proc_lock=None, timeout=180):
+    if is_rgba8_format(comp_format_display):
+        in_abs = os.path.normcase(os.path.abspath(input_file))
+        out_abs = os.path.normcase(os.path.abspath(output_file))
+        if in_abs == out_abs:
+            if os.path.isfile(output_file) and os.path.getsize(output_file) >= 128:
+                return
+        if os.path.isfile(input_file):
+            import shutil
+            out_dir = os.path.dirname(output_file)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            shutil.copy2(input_file, output_file)
+            return
+        raise RuntimeError(f"RGBA8 input file missing: {input_file}")
+
     if not is_available(exe_path):
         raise RuntimeError(f"Compression engine not found: {exe_path}")
 
@@ -329,16 +473,29 @@ def _round_to_block_multiple(value: float) -> int:
     return max(4, int(round(value / 4.0)) * 4)
 
 
-def resolve_target_dimensions(width: int, height: int, target_max, enforce_pot: bool):
+def resolve_target_dimensions(width: int, height: int, target_max, enforce_pot: bool, is_tint: bool = False):
     """Compute output dimensions.
 
     ``target_max`` can be:
       - An int > 0 : clamp longest edge to that pixel count.
       - A str like ``"50%"`` or ``"25%"`` : scale both axes by that percentage.
-      - 0 or falsy : keep original size (still honours *enforce_pot*).
+      - 0 or falsy : keep original size (still honours *enforce_pot* unless *is_tint* is True).
     """
     if max(width, height) == 0:
         return width, height
+
+    if is_tint:
+        # Tint palettes must strictly preserve their exact resolution and ignore PoT/block rules
+        if not target_max or target_max == "ORIGINAL":
+            return width, height
+        scale = 1.0
+        if isinstance(target_max, str) and target_max.endswith('%'):
+            pct = float(target_max.rstrip('%')) / 100.0
+            scale = max(pct, 0.01)
+        elif isinstance(target_max, (int, float)) and target_max > 0:
+            if max(width, height) > target_max:
+                scale = target_max / max(width, height)
+        return max(1, round(width * scale)), max(1, round(height * scale))
 
     scale = 1.0
 
@@ -358,8 +515,10 @@ def resolve_target_dimensions(width: int, height: int, target_max, enforce_pot: 
 
 
 def resolve_role_default_format(role: str, has_alpha: bool) -> str:
-    """Return the recommended BC format for a given Sollumz sampler role."""
+    """Return the recommended format for a given Sollumz sampler role."""
     r = strip_blender_suffix(role).lower()
+    if any(x in r for x in ("tint", "palette", "pal")):
+        return "RGBA8 (8.8.8.8)"
     if any(x in r for x in ("bump", "normal", "nrm")):
         return "DXT1 (BC1)"
     if has_alpha:
@@ -369,13 +528,17 @@ def resolve_role_default_format(role: str, has_alpha: bool) -> str:
 
 def resolve(global_res, global_format: str, role: str, has_alpha: bool, override) -> dict:
     """Return resolved resolution and format, considering role rules and overrides."""
-    res = global_res
+    r = strip_blender_suffix(role).lower()
+    is_tint = any(x in r for x in ("tint", "palette", "pal"))
+
+    # Tint palettes ignore global downscale presets by default
+    res = 0 if is_tint else global_res
 
     if global_format == "Auto (By Role)":
         fmt = resolve_role_default_format(role, has_alpha)
     else:
         fmt = global_format
-        if fmt == "DXT1 (BC1)" and has_alpha:
+        if fmt == "DXT1 (BC1)" and has_alpha and not is_tint:
             fmt = "DXT5 (BC3)"
 
     if override is not None and getattr(override, "use_override", False):
