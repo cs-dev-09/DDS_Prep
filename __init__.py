@@ -1,7 +1,7 @@
 bl_info = {
     "name": "DDS Prep",
     "author": "CSDev",
-    "version": (1, 0, 0),
+    "version": (1, 0, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > DDS Prep",
     "description": "Batch-converts source textures on Sollumz materials to "
